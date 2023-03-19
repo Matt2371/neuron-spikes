@@ -1,0 +1,1066 @@
+---
+title: "Analysis of spike neuron train data in rats in response to visual stimuli"
+author: "Matthew Chen"
+date: "2023-03-19"
+output:
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    df_print: paged
+    number_sections: yes
+    code_folding: hide
+---
+
+```{r, warning=F, message=F, error=F}
+## load libraries
+
+library(ggplot2)
+library(reshape)
+library(tidyverse)
+library(qwraps2)
+library(gplots)
+library(patchwork)
+library(lme4)
+library(lmerTest)
+library(knitr)
+library(ROCR)
+library(randomForest)
+library(lme4)
+options(qwraps2_markup = "markdown")
+```
+
+# Abstract
+In this project, we use a subset of data from Steinmetz et al. (2019) to study how brain activity, specifically neuron firings, are associated with the process of being shown visual stimuli and performing as simple task. In the original study, mice were shown different contrast levels on either side and performed a simple task in response, with their brain activity recorded during the process. We find evidence that neurons and their respective spike train data may be clustered empirically into different types using k-means clustering, and that the behavior of these neurons in response to the visual stimuli (especially left contrast) depended strongly on the cluster of neurons analyzed. Notably, by fitting linear mixed-effects ANOVA model on each cluster type, we find that the interaction between right and left contrasts are significant for some clusters but not all. We also predict the success or failure of the feedback using only summarizing measures of brain activity, specifically, mean firing rates on all three neuron clusters, and the corresponding contrast levels using logistic regression and random forest. Decent prediction performance was obtained for both models, which suggests an association exists between neural activity and the corresponding stimuli with decision making in this experiment.
+
+# Introduction and Background
+Steinmetz et al. (2019) studied the distribution of brain signals underlying the basic processes of vision, choice, and behavior. In the study, neuron spikes in mice were observed over 39 different sessions using Neuropixels probes as the mice responded to varying visual stimuli and performed a simple task. The data from this study is very valuable in understanding how the neural activity associated with the processing and response to sensory information is distributed in the brain, which is still poorly understood by the scientific community. This research provides insight into not only how the brains of trained rats behave, but also in the complex neural signals in our own human brains.
+
+
+In each trial, visual stimuli of varying contrasts in four levels (no stimuli (0), 0.25, 0.5, and 1) were shown to the mouse on both its right and left sides. Note that the stimuli on the left and the right are not necessarily the same. Then, the mouse would turn a wheel in the direction corresponding to the side with the higher contrast, and on successful attempts the mouse was granted a water reward. The resulting spike train data was then recorded in 39 uniform time windows, where the number of neuron spikes in each bin is summed and the timestamps corresponding to the center of the time bins tracked. Further, the feedbacks for each trial were also recorded, with +1 indicating the mouse performed the task successfully, and -1 indicating otherwise. Note that the mice were rigorously pre-trained on this task beforehand so that trials are as consistent with each other as possible. In the event that both contrasts were zero (i.e. the contrast on both sides was zero), the mouse was rewarded for providing no action for the duration of 1.5 seconds. If both sides had equal contrast, the mouse was rewarded randomly with equal probabilities on either direction of the wheel turn.
+
+
+Overall, Steinmetz et al. (2019) conducted the study over 39 different sessions where each session consisted of hundreds of trials, and the contrast levels for each trial were randomly assigned. The experiment involved 10 different mice, and each session had only one mouse. In total, the study recorded neural activity from 92 Neuropixels probe insertions and approximately 30,000 neurons distributed in over 40 different brain regions. Figure 1 in Steinmetz et al. (2019) provides a high level summary of the experimental setup involved.
+
+
+In this project, we analyze a subset of 5 sessions out of the 39 in the original data, with the goal of specifically analyzing how visual stimuli correspond to recorded neuron spikes in the visual cortex and the outcome of the performed task. Additionally, we focus on an analysis period of 0.4 seconds after the stimulation onset, which is consistent with the analysis in the original paper. Here, we ask the following research questions:
+
+<br/>
+
+1. How do neurons in the visual cortex respond to visual stimuli? Specifically, are there interactions between stimuli on either side and recorded brain activity? Does this behavior change with different types of neurons or is the response homogeneous across all neurons? <br/>
+2. How strongly is neural activity and the corresponding stimuli linked to the outcome of the performed task? I.e., are we able to predict the success of the outcome using only information about neural activity and the associated stimuli to the task? <br/>
+
+# Descriptive Analysis
+A table summarizing information of when the experiment sessions were conducted and the participating mice for each of the five sessions is presented below.
+
+```{r, warning=F, message=F, error=F}
+# load in data
+session=list()
+for(i in 1:5){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+}
+
+# Mouse name and experiment date
+experiment_dates = c()
+mouse_names = c()
+sessions = 1:5
+
+for (i in 1:5){
+  experiment_dates[i] = session[[i]]$date_exp
+  mouse_names[i] = session[[i]]$mouse_name
+}
+
+table = data.frame(sessions, mouse_names, experiment_dates)
+colnames(table) = c('Session', 'Mouse name', 'Experiment date')
+kable(table, caption='Description of each experiment session')
+```
+
+```{r, warning=F, message=F, error=F}
+# Function to create a dataframe of of firing rates for each neuron for each Session
+# averaged over [0,0.4] seconds since stimulation onsets
+
+convert_data <- function(session_number) {
+  ID=session_number
+  t=0.4 # Length of analysis period, from Background 
+  
+  n.trials=length(session[[ID]]$spks) # Number of trials
+  n.neurons=dim(session[[ID]]$spks[[1]])[1] # Number of neurons
+  
+  # Create dataframe to store all the data for the session
+  data = data.frame(matrix(ncol = n.neurons + 3, nrow = n.trials))
+  
+  # Get firing rates (for each neuron, sum all spikes and divide by the analysis period)
+  for(i in 1:n.trials){
+    data[i, 1:n.neurons] = rowSums(as.data.frame(session[[ID]]$spks[[i]])) / t
+  }
+  
+  # Add right contrast
+  data[, n.neurons + 1] = session[[ID]]$contrast_left
+  
+  # Add left contrast
+  data[, n.neurons + 2] = session[[ID]]$contrast_right
+  
+  # Add feedback
+  data[, n.neurons + 3] = session[[ID]]$feedback_type
+  
+  # Rename columns
+  names = c()
+  names[1:n.neurons] = paste('neuron', as.character(1:n.neurons))
+  names[n.neurons+1] = 'contrast_left'
+  names[n.neurons+2] = 'contrast_right'
+  names[n.neurons+3] = 'feedback_type'
+  colnames(data) = names
+  
+  return(data)
+}
+
+test = convert_data(1)
+```
+
+Below, we examine the distribution of average firing rates (across trials in its respective session) of all neurons in each session using histograms. Immediately, we notice that neuron behavior may differ significantly from each other. For example, some neurons have very low average firing rates, others have intermediate firing rates, and some fire significantly more than the others. Thus, it may be prudent to explore the behavior of different neuron types and discover insights that are not possible with studying all neurons collectively. Since the raw data does not provide information about neuron types, we use a data driven approach to separate potential neuron types using a clustering algorithm. We additionally find that there are many neurons that did not fire or fired very little. Since we are fundamentally interested in how neurons respond to stimuli, it makes sense to remove the noise resulting from neurons that do not or rarely fire. By inspecting the histograms below, we choose to drop neurons that had an average firing rate of one or less. In the clustering analysis proposed above, this can be considered as the “first cluster” where firing rates are especially low. However, since we are primarily interested in how different types of neurons respond to stimuli, we do not further consider this first cluster as it had very little response to the stimuli.
+
+```{r, warning=F, message=F, error=F}
+# examine the average firing rate for each neuron averaged across trials (look at low range)
+par(mfrow = c(2,3))
+
+for (i in 1:5){
+  neuron_avg = colMeans(convert_data(i)) # average across trials
+  neuron_avg = neuron_avg[1:(length(neuron_avg)-3)]
+  hist(neuron_avg, main=paste("Session ", as.character(i)), xlab="Average firing rate per neuron", breaks=50)
+  
+}
+```
+
+```{r, warning=F, message=F, error=F}
+# data with dropped neurons (start with copy of session object)
+session_drop1 = session
+
+# for each session
+for (i in 1:length(session)){
+  
+  # find neurons where the average firing rate <1.0
+  avg_firing = colMeans(convert_data(i))
+  avg_firing = avg_firing[1:(length(avg_firing)-3)]
+  
+  # drop neurons for each trial in session
+  for (j in 1:length(session[[i]]$spks)){
+    session_drop1[[i]]$spks[[j]] = session[[i]]$spks[[j]][avg_firing >= 1, ]
+  }
+}
+```
+
+We also consider the overall mean firing rate across all neurons, which gives us a baseline comparison for the ensuing clustering analysis. The mean gives us a conglomerate measure of all neurons which we can compare to the behavior of the different clusters as a baseline. Descriptive statistics of this mean response is provided in the summary table below, along with some information concerning the right, left, and feedback in the experiment. A key takeaway is that for both right and left contrast, there are much more 0 contrast trials than the other contrast levels. There are also about twice as many positive feedbacks compared to negative. As a side note, this is indicates that we do not have a balanced design and thus any ANOVA F-tests conducted later on should be Type 2 or Type 3.
+
+```{r, warning=F, message=F, error=F}
+# Obtain the firing rate 
+# averaged over [0,0.4] seconds since stimulation onsets
+# averaged across all neurons 
+# Function to get average firing rate for each session
+
+average_rate <- function(session_number, data) {
+  ID=session_number
+  t=0.4 # Length of analysis period, from Background 
+  
+  n.trials=length(data[[ID]]$spks)
+  n.neurons=dim(data[[ID]]$spks[[1]])[1]
+  
+  # Obtain the firing rate 
+  avg_firingrate=numeric(n.trials)
+  for(i in 1:n.trials){
+    avg_firingrate[i]=sum(data[[ID]]$spks[[i]])/n.neurons/t
+  }
+    
+  return(avg_firingrate)
+}
+
+# get average firing rates for each session
+avg_rate1 = average_rate(1, session_drop1)
+avg_rate2 = average_rate(2, session_drop1)
+avg_rate3 = average_rate(3, session_drop1)
+avg_rate4 = average_rate(4, session_drop1)
+avg_rate5 = average_rate(5, session_drop1)
+
+# vector of concatenated session ID's
+session_id = c(rep(1, length(avg_rate1)), rep(2, length(avg_rate2)), rep(3, length(avg_rate3)), rep(4, length(avg_rate4)), rep(5, length(avg_rate5)))
+
+# vector of average firing rates
+avg_rate_vec = c(avg_rate1, avg_rate2, avg_rate3, avg_rate4, avg_rate5)
+
+# vector of left contrasts
+left_contrasts_vec = c(session[[1]]$contrast_left, session[[2]]$contrast_left, session[[3]]$contrast_left, session[[4]]$contrast_left, session[[5]]$contrast_left)
+
+# vector of right contrasts
+right_contrasts_vec = c(session[[1]]$contrast_right, session[[2]]$contrast_right, session[[3]]$contrast_right, session[[4]]$contrast_right, session[[5]]$contrast_right)
+
+# vector of feedbacks
+feedbacks_vec = c(session[[1]]$feedback_type, session[[2]]$feedback_type, session[[3]]$feedback_type, session[[4]]$feedback_type, session[[5]]$feedback_type)
+
+# combine into dataframe
+avg_rates = data.frame(matrix(nrow = length(avg_rate1) + length(avg_rate2) + length(avg_rate3) + length(avg_rate4) + length(avg_rate5), ncol=5))
+
+# add data
+avg_rates[, 1] = session_id
+avg_rates[, 2] = avg_rate_vec
+avg_rates[, 3] = left_contrasts_vec
+avg_rates[, 4] = right_contrasts_vec
+avg_rates[, 5] = feedbacks_vec
+
+# rename columns
+colnames(avg_rates) = c('session', 'avg_rate', 'left_contrast', 'right_contrast', 'feedback')
+```
+
+```{r, echo=FALSE, results = "asis"}
+# Create univariate summary table(using qwraps)
+our_summary1 =
+  list("Left contrasts" =
+       list("Counts: 0 contrast" = ~table(avg_rates$left_contrast)[1],
+            "Counts: 0.25 contrast" = ~table(avg_rates$left_contrast)[2],
+            "Counts: 0.5 contrast" = ~table(avg_rates$left_contrast)[3],
+            "Counts: 1 contrast" = ~table(avg_rates$left_contrast)[4]),
+       
+       "Right contrasts" =
+       list("Counts: 0 contrast" = ~table(avg_rates$right_contrast)[1],
+            "Counts: 0.25 contrast" = ~table(avg_rates$right_contrast)[2],
+            "Counts: 0.5 contrast" = ~table(avg_rates$right_contrast)[3],
+            "Counts: 1 contrast" = ~table(avg_rates$right_contrast)[4]),
+       
+       "Feedbacks" =
+       list("Counts: negative" = ~table(avg_rates$feedback)[1],
+            "Counts: positive" = ~table(avg_rates$feedback)[2]),
+       
+       "Average firing rate (across all neurons)" =
+       list("min" = ~ round(min(avg_rate), 2),
+            "mean (+/-sd)" = ~ qwraps2::mean_sd(avg_rate),
+            "median" = ~round(median(avg_rate), 2),
+            "max" = ~ round(max(avg_rate), 2)))
+
+
+whole = summary_table(avg_rates, our_summary1)
+print(whole, cnames = 'Univariate Statistics')
+```
+
+Since we are interested in comparing behaviors between sessions, it is prudent to ensure that the sessions themselves are comparable. We find that the distributions of right contrast, left contrast, and feedbacks are indeed comparable between the sessions (see Appendix). This is non surprising given the fact that contrasts were randomly assigned for each trial.
+
+<br/>
+
+A challenge with using a potential clustering analysis on this dataset is the fact that each session has a different number of trials and a different number of neurons (this is summarized by a table below), which makes it difficult to infer neuron types between sessions.
+
+```{r, warning=F, message=F, error=F}
+# Table of the number of trials and neurons per session
+num_trials_neurons = function(session_number, data=session_drop1){
+  ID = session_number
+  num_trials= length(data[[ID]]$spks)
+  num_neurons = dim(data[[ID]]$spks[[1]])[1]
+  
+  return(c(num_trials, num_neurons))
+}
+
+n_trials = c(num_trials_neurons(1)[1], num_trials_neurons(2)[1], num_trials_neurons(3)[1], num_trials_neurons(4)[1], num_trials_neurons(5)[1])
+n_neurons = c(num_trials_neurons(1)[2], num_trials_neurons(2)[2], num_trials_neurons(3)[2], num_trials_neurons(4)[2], num_trials_neurons(5)[2])
+sessions_id = c(1, 2, 3, 4, 5)
+
+data = matrix(c(sessions_id, n_trials, n_neurons), ncol=3)
+colnames(data) = c('Session', 'Trials', 'Neurons')
+rownames(data) = rep('', 5)
+kable(as.table(data), caption="Number of trials and neurons per session")
+```
+
+One strategy to handle this is to average the spikes on corresponding timestamps across all trials in that session. This relies on us we making the assumption that the same neuron type behaves the similarly in time across all trials in the same session. This assumption enables us to remove the trial dimension, and use k-means clustering to assign each neuron to k clusters across all sessions.
+
+In the project, we choose k-means to cluster neural behavior. Notably, k-means uses the Euclidean distance between vectors as its similarity measure (see below) and unfortunately does not account for the fact that similar behavior from the same neuron type may be time-lagged. However, if the similar behavioral patterns do not lag much in time, Euclidean distance as a similarity measure should efficiently choose neurons that fire similarly over time. Additionally, we are making the assumption that similar behavior will occur across different sessions for neurons of the same type/cluster. Furthermore, to account for potential differences in the spike train magnitudes of neurons from different sessions (fundamentally, from different mice), we standardize each neuron. By doing this, we are only considering the shapes of the different neuron behaviors, and not the absolute magnitude of the spike train data.
+
+The k-means clustering algorithm seeks to solve the following optimization problem that minimizes the within-cluster variance:
+
+
+
+
+$$
+\underset{S = \{S_1, S_2, ..,S_k\}}{\mathrm{argmin}}
+\sum_{i=1}^k\sum_{x\in S_i}||x-\mu_i||^2
+$$
+<br/>
+
+
+where $S=\{S1,S2,..,Sk\}$ is the set of one to k clusters indexed by i, x is one vector of observations (in this case, the average spikes over time for one neuron), and $μ_i$ is the centroid for the ith cluster.
+
+```{r, warning=F, message=F, error=F}
+# Function to get the trial-averaged spikes for each neuron given Session ID
+
+average_trials = function(session_number, data){
+  
+  ID = session_number
+  
+  # Get number of trials and neurons in session 
+  n.trials=length(data[[ID]]$spks)
+  n.neurons=dim(data[[ID]]$spks[[1]])[1]
+  
+  # Sum over all arrays in list (sum over trials)
+  sum_trials = Reduce(`+`, data[[ID]]$spks)
+  
+  # Find the average (divide sum by number of trials)
+  spk_avg = sum_trials / n.trials
+  
+  # Normalize each column in matrix (standardize across neurons)
+  spk_avg = scale(t(spk_avg))
+  
+  spk_avg = t(spk_avg)
+  
+  return(spk_avg)
+}
+
+
+# Get average spikes (across trials) for all Sessions
+avg_trials1 = average_trials(1, session_drop1)
+avg_trials2 = average_trials(2, session_drop1)
+avg_trials3 = average_trials(3, session_drop1)
+avg_trials4 = average_trials(4, session_drop1)
+avg_trials5 = average_trials(5, session_drop1)
+
+# Combine into one dataframe (we will conduct k-means on this data)
+all_scale_neurons = rbind(avg_trials1, avg_trials2, avg_trials3, avg_trials4, avg_trials5)
+```
+
+Here, we use an elbow plot to decide on the number of clusters to use, plotting the ratio between the between-group sum of squares and the total sum of squares for each cluster. This strategy allows us to choose a balance between explaining as much variance in the data as possible with the clusters, and overfitting the data, i.e., it is a purely data driven approach to choose the number of clusters. The inflection point occurs approximately at 3 neurons, so we empirically fit 3 different clusters of neurons. The fact that there are three basic types of neurons (sensory, motor, and inter-neurons) further adds interpretability to this choice [2]. However, it is important to note that we cannot claim that the 3 clusters we obtained correspond to these neuron types since we fit the clusters empirically.
+
+```{r, warning=F, message=F, error=F}
+set.seed(1)
+
+# Assign neurons to clusters using k-menas, find optimal number of clusters using the sum of the within group sum of squares
+ratio = c()
+for (i in 1:10){
+  ratio[i] = kmeans(all_scale_neurons, centers = i, nstart=10, iter.max=100)$betweenss / kmeans(all_scale_neurons, centers = i, nstart=10)$totss
+}
+
+plot(1:10, ratio, type='b', xlab='number of clusters', ylab='between group over total sum of squares', main='Elbow plot to choose number of clusters')
+```
+
+
+<br/>
+
+
+```{r, warning=F, message=F, error=F}
+# fit kmeans with 3 clusters
+kmeans = kmeans(all_scale_neurons, centers = 3, nstart=10, iter.max=100)
+
+# add clusters to dataframe
+all_scale_neurons = as.data.frame(all_scale_neurons)
+all_scale_neurons$cluster = kmeans$cluster
+
+# add session information (order is preserved)
+all_scale_neurons$session = c(rep(1, dim(session_drop1[[1]]$spks[[1]])[1]),
+                              rep(2, dim(session_drop1[[2]]$spks[[1]])[1]),
+                              rep(3, dim(session_drop1[[3]]$spks[[1]])[1]),
+                              rep(4, dim(session_drop1[[4]]$spks[[1]])[1]),
+                              rep(5, dim(session_drop1[[5]]$spks[[1]])[1]))
+
+## add clusters to original data
+
+# Def function to add array of clusters to each session (corresponds with each neuron in that session)
+add_clusters = function(data, cluster_array){
+  
+  # counter of how many neurons have been taken into account already
+  neuron_counter = 1 
+  
+  # for each session
+  for (i in 1:length(data)){
+    
+    n.neurons = dim(data[[i]]$spks[[1]])[1]
+    
+    #subset cluster_array to include respective clusters for each session
+    session_clusters = cluster_array[neuron_counter:(neuron_counter+n.neurons-1)]
+    
+    # add information to session data
+    data[[i]]$clusters = session_clusters
+    
+    # update neuron_counter
+    neuron_counter = neuron_counter + n.neurons
+  }
+  
+  return(data)
+}
+
+cluster_array = kmeans$cluster
+session_drop1 = add_clusters(session_drop1, cluster_array)
+```
+
+
+After the clusters are obtained, we are able to summarize the behavior of hundreds of neurons into three metrics per trial (one for each cluster) and allows for future ANOVA analysis on each cluster. Here, we choose the average firing rate across neurons in a given cluster as our summarizing measure, since it provides a conglomerate metric for all neurons in that cluster for each trial, as well as removes the time dimension.
+
+```{r, warning=F, message=F, error=F}
+# Function to get average firing rate given cluster and given session. Obtain the firing rate averaged over [0,0.4] seconds since stimulation onsets averaged across all neurons 
+average_rate_cluster = function(session_number, cluster_number, data) {
+  ID=session_number
+  cluster=cluster_number
+  t=0.4 # length of analysis period, from Background 
+  
+  n.trials=length(data[[ID]]$spks)
+  n.neurons=sum(data[[ID]]$clusters==cluster) #number of neurons in defined cluster and session
+  
+  # obtain the firing rate 
+  avg_firingrate=numeric(n.trials)
+  
+  for(i in 1:n.trials){
+    # subset data based on cluster
+    avg_firingrate[i]=sum(data[[ID]]$spks[[i]][data[[ID]]$clusters==cluster, ])/n.neurons/t
+  }
+    
+  return(avg_firingrate)
+}
+
+# Function to combine average firing rates for a given cluster into a dataframe (for each trial for each session)
+
+cluster_df = function(cluster_number, data){
+  
+  cluster = cluster_number
+  
+  # get average firing rates for each session for defined cluster
+  avg_rate1 = average_rate_cluster(1, cluster, data)
+  avg_rate2 = average_rate_cluster(2, cluster, data)
+  avg_rate3 = average_rate_cluster(3, cluster, data)
+  avg_rate4 = average_rate_cluster(4, cluster, data)
+  avg_rate5 = average_rate_cluster(5, cluster, data)
+  
+  # vector of concatenated session ID's
+  session_id = c(rep(1, length(avg_rate1)), rep(2, length(avg_rate2)), rep(3, length(avg_rate3)), rep(4, length(avg_rate4)), rep(5, length(avg_rate5)))
+  
+  # vector of average firing rates
+  avg_rate_vec = c(avg_rate1, avg_rate2, avg_rate3, avg_rate4, avg_rate5)
+  
+  # vector of left contrasts
+  left_contrasts_vec = c(session[[1]]$contrast_left, session[[2]]$contrast_left, session[[3]]$contrast_left, session[[4]]$contrast_left, session[[5]]$contrast_left)
+  
+  # vector of right contrasts
+  right_contrasts_vec = c(session[[1]]$contrast_right, session[[2]]$contrast_right, session[[3]]$contrast_right, session[[4]]$contrast_right, session[[5]]$contrast_right)
+  
+  # vector of feedbacks
+  feedbacks_vec = c(session[[1]]$feedback_type, session[[2]]$feedback_type, session[[3]]$feedback_type, session[[4]]$feedback_type, session[[5]]$feedback_type)
+  
+  # vector of cluster number
+    num_rows = length(avg_rate1) + length(avg_rate2) + length(avg_rate3) + length(avg_rate4) +   length(avg_rate5)
+  clusters_vec = rep(cluster, num_rows)
+  
+  # combine into dataframe
+  avg_rates = data.frame(matrix(nrow = num_rows, ncol=6))
+  
+  # add data
+  avg_rates[, 1] = session_id
+  avg_rates[, 2] = avg_rate_vec
+  avg_rates[, 3] = left_contrasts_vec
+  avg_rates[, 4] = right_contrasts_vec
+  avg_rates[, 5] = feedbacks_vec
+  avg_rates[, 6] = clusters_vec
+  
+  # rename columns
+  colnames(avg_rates) = c('session', 'avg_rate', 'left_contrast', 'right_contrast', 'feedback', 'cluster')
+  
+  return(avg_rates)
+}
+
+# Get average firing rates (one per trial) for all clusters
+cluster1_df = cluster_df(1, session_drop1)
+cluster2_df = cluster_df(2, session_drop1)
+cluster3_df = cluster_df(3, session_drop1)
+
+# Convert session, left, right contrast to factor
+avg_rates$session = as.factor(avg_rates$session)
+avg_rates$left_contrast = as.factor(avg_rates$left_contrast)
+avg_rates$right_contrast = as.factor(avg_rates$right_contrast)
+
+cluster1_df$session = as.factor(cluster1_df$session)
+cluster1_df$left_contrast = as.factor(cluster1_df$left_contrast)
+cluster1_df$right_contrast = as.factor(cluster1_df$right_contrast)
+
+cluster2_df$session = as.factor(cluster2_df$session)
+cluster2_df$left_contrast = as.factor(cluster2_df$left_contrast)
+cluster2_df$right_contrast = as.factor(cluster2_df$right_contrast)
+
+cluster3_df$session = as.factor(cluster3_df$session)
+cluster3_df$left_contrast = as.factor(cluster3_df$left_contrast)
+cluster3_df$right_contrast = as.factor(cluster3_df$right_contrast)
+```
+
+
+Below, we plot the standardized trail-averaged spike train data (the metric that clustering was based upon) for 120 randomly selected neurons. From the smoothed lines (shown in blue) and the mean of all neurons (shown in red), we see that neurons in each cluster behave roughly similarly to each other though there is a large variance between neurons. This is promising and supports the hypothesis that there are different types of neurons that may exist in clusters, especially if we are able to show that the clusters’ firing patterns differ from each other.
+
+
+```{r, warning=F, message=F, error=F}
+## show that neurons are comparable to each other
+all_neurons = subset(all_scale_neurons, select=-c(session))
+colnames(all_neurons) = c(1:39, 'cluster')
+all_neurons$neuron_id = 1:(dim(all_neurons)[1])
+
+# get mean trend of all neurons by cluster
+mean_trend = subset(all_neurons, select=-c(neuron_id)) %>% group_by(cluster) %>% summarize_all("mean")
+mean_trend = reshape2::melt(mean_trend, id.vars='cluster')
+# add neuron id column for ggplot to work
+mean_trend$neuron_id = rep(1, nrow(mean_trend))
+
+# randomly sample 120 neurons
+subset_neurons = all_neurons[sample(nrow(all_neurons), 120), ]
+subset_neurons$neuron_id = 1:(dim(subset_neurons)[1])
+
+# convert subset df to long format
+subset_neurons = melt(subset_neurons, id.vars=c('cluster', 'neuron_id'))
+
+
+# plot
+cluster_labs = c('Cluster 1', 'Cluster 2', 'Cluster 3')
+names(cluster_labs) = c(1, 2, 3)
+
+ggplot(subset_neurons, aes(x=variable, y=value, group=neuron_id)) + 
+  geom_point(size=0.5) +
+  geom_smooth(alpha=0.1, size=0.5, span=0.4) + 
+  geom_line(data=mean_trend, aes(x=variable, y=value, group=neuron_id), color='red', size=1) +
+  facet_grid(cluster ~ ., labeller=labeller(cluster=cluster_labs)) +
+  ylab('Standardized trial averaged spike train data') +
+  xlab('Timestep') +
+  ggtitle('Clustered trial average spike trains, 120 random neurons')
+```
+
+
+<br/>
+
+
+Here we plot the distribution of mean firing rate for each cluster on each session to see if the clusters have different firing rates compared to each other. Immediately, we notice that there are obvious differences in general behavior between the clusters for each session. Additionally, the behavior of each cluster shows similarities across sessions, with exceptions. For example, cluster 2 usually has the smallest variance of the different clusters (highest peak), but this is not true for session 5. Cluster 1 has a similar shape in all sessions, but has much higher variance in session 3 and a much higher peak in session 5.
+
+
+
+It is important to note that the clusters were grouped based only on scaled behavior over time, considering only the shape of the response for that neuron during the course of that experiment. This is biologically related to firing rate but the connection is unclear, however, in the plot below we see notable differences in firing rates between the clusters. Additionally, we see that differences in sessions may underscore the importance of taking into account the effects of the different rats as they may behave fundamentally differently. For example, in an ANOVA analysis, we could include a random intercept for Session, reflecting the randomness that may occur due to the difference in rats and other session-specific variables.
+
+
+```{r, warning=F, message=F, error=F}
+## Plot distribution of mean firing rate for each trial for each cluster
+avg_rates$cluster = rep('all neurons', dim(avg_rates)[1])
+all_clusters_rates = rbind(cluster1_df, cluster2_df, cluster3_df, avg_rates)
+all_clusters_rates$cluster = as.factor(all_clusters_rates$cluster)
+all_clusters_rates$left_contrast = as.factor(all_clusters_rates$left_contrast)
+all_clusters_rates$right_contrast = as.factor(all_clusters_rates$right_contrast)
+
+p1 = ggplot(all_clusters_rates[all_clusters_rates$session==1, ], aes(x=avg_rate, fill=cluster, color=cluster)) +
+  geom_density(alpha=0.1) + ggtitle('Session 1') +
+  xlab('average firing rate')
+
+p2 = ggplot(all_clusters_rates[all_clusters_rates$session==2, ], aes(x=avg_rate, fill=cluster, color=cluster)) +
+  geom_density(alpha=0.1) + ggtitle('Session 2') +
+  xlab('average firing rate')
+
+p3 = ggplot(all_clusters_rates[all_clusters_rates$session==3, ], aes(x=avg_rate, fill=cluster, color=cluster)) +
+  geom_density(alpha=0.1) + ggtitle('Session 3') +
+  xlab('average firing rate')
+
+p4 = ggplot(all_clusters_rates[all_clusters_rates$session==4, ], aes(x=avg_rate, fill=cluster, color=cluster)) +
+  geom_density(alpha=0.1) + ggtitle('Session 4') +
+  xlab('average firing rate')
+
+p5 = ggplot(all_clusters_rates[all_clusters_rates$session==5, ], aes(x=avg_rate, fill=cluster, color=cluster)) +
+  geom_density(alpha=0.1) + ggtitle('Session 5') +
+  xlab('average firing rate')
+
+p1 + p2 + p3 + p4 + p5 + plot_layout(ncol=2)
+```
+
+
+<br/>
+
+
+To further emphasize the differences of firing rates between sessions, we plot box plots of mean firing rates across sessions below. Here, we note that Sessions 1-3 (Cori) tends to have much higher firing rates compared to Sessions 4-5 (Forssman). Interestingly, this is true for all the clusters except for cluster 2 where the mean firing rate is very similar across sessions.
+
+```{r, warning=F, message=F, error=F}
+# Create boxplots of average firing rates for each session
+all = ggplot(avg_rates, aes(as.factor(session), avg_rate)) + geom_boxplot() + 
+  xlab('session') + ylab('average firing rate') + ggtitle('all neurons')
+
+cluster1 = ggplot(cluster1_df, aes(as.factor(session), avg_rate)) + geom_boxplot() + 
+  xlab('session') + ylab('average firing rate') + ggtitle('cluster 1')
+
+cluster2 = ggplot(cluster2_df, aes(as.factor(session), avg_rate)) + geom_boxplot() + 
+  xlab('session') + ylab('average firing rate') + ggtitle('cluster 2')
+
+cluster3 = ggplot(cluster3_df, aes(as.factor(session), avg_rate)) + geom_boxplot() + 
+  xlab('session') + ylab('average firing rate') + ggtitle('cluster 3')
+
+all + cluster1 + cluster2 + cluster3 + plot_layout(ncol=2)
+```
+
+
+<br/>
+
+
+Finally, a table of counts of how many neurons of each cluster appear in each session is also shown below. We find that each cluster type appears in all session, although they are not necessarily evenly distributed. These differences could be due to a myraid of complex reasons such as experimental setup (i.e. probing different neurons of the rat’s brain during different sessions) or other variables intrinsic to the session itself (fundamental differences between Cori and Forssman). Overall, the findings that the clusters are 1) neurons in the same cluster generally behave similarly, 2) different clusters have different distributions of firing rates, and 3) some behavior is consistent even between sessions and that all 3 clusters exist in all sessions further adds interpretability to the clustering analysis.
+
+
+```{r, warning=F, message=F, error=F}
+# Table of the number of neurons per session
+num_neurons = function(session_number, og_data=session, drop_data=session_drop1){
+  ID = session_number
+  
+  all = length(drop_data[[ID]]$clusters)
+  
+  cluster1 = sum(drop_data[[ID]]$clusters == 1)
+  cluster2 = sum(drop_data[[ID]]$clusters == 2)
+  cluster3 = sum(drop_data[[ID]]$clusters == 3)
+  
+  return(c(all, cluster1, cluster2, cluster3))
+}
+
+data = matrix(data = c(num_neurons(1), num_neurons(2), num_neurons(3), num_neurons(4), num_neurons(5)), ncol=4, nrow=5, byrow = TRUE)
+rownames(data) = c('Session 1', 'Session 2', 'Session 3', 'Session 4', 'Session 5')
+colnames(data) = c('All', 'Cluster 1', 'Cluster 2', 'Cluster 3')
+
+kable(as.table(data), caption="Distribution of cluster types in each session")
+```
+
+
+Here, we show the main effects plot for left contrast for each cluster, and for the mean effect of all neurons. Immediately we observe differences in behavior in how different clusters respond to the left contrast level. For example, cluster 1 has the highest mean firing rate corresponding to a left contrast of 0.5, cluster 2 has the highest mean firing rate at 0 contrast, and cluster 3 has the highest firing rate at a left contrast of 1. This result supports the hypothesis that distinct clusters with different behaviors do in fact exist, and that these clusters respond differently to the same stimuli.
+
+```{r, warning=F, message=F, error=F}
+# get main effects plot for left contrast
+mean_rates_left = all_clusters_rates %>% group_by(cluster, left_contrast) %>% summarise(mean=mean(avg_rate), std=sd(avg_rate))
+
+
+p1 = ggplot(mean_rates_left, aes(x=left_contrast, y=mean, group=cluster)) + 
+  geom_line(aes(color=cluster)) + 
+  geom_point(aes(color=cluster)) + 
+  ylab('average firing rate') + 
+  xlab('left contrast') +
+  ggtitle('Main effects plot for left contrast')
+
+p1
+```
+
+
+<br/>
+
+
+Below, we plot the main effects plots for right contrast similar to above. Interestingly, there are no clear differences in behavior across clusters in these plots. However, the magnitude of cluster 1 is noticeably higher than the other clusters.
+
+```{r, warning=F, message=F, error=F}
+# get main effects for right contrast
+mean_rates_right = all_clusters_rates %>% group_by(cluster, right_contrast) %>% summarise(mean=mean(avg_rate), std=sd(avg_rate))
+
+p2 = ggplot(mean_rates_right, aes(x=right_contrast, y=mean, group=cluster)) + 
+  geom_line(aes(color=cluster)) + 
+  geom_point(aes(color=cluster)) + 
+  ylab('average firing rate') + 
+  xlab('right contrast') +
+  ggtitle('Main effects plot for right contrast')
+
+p2
+```
+
+
+<br/>
+
+
+# Inferential Analysis
+## Interaction Between Left and Right Contrasts
+
+We can test for the statistical significance of the interaction between left and right contrasts in response to average firing rate by conducting an ANOVA test between a full and reduced model where the full model includes the interaction term and the reduced model does not. Also, as aforementioned, we need to account for the differences between sessions. One way to handle this is to treat session as a random effect, and consider our 5 sessions as being drawn from a population of sessions. This will account for the differences between the mice assigned to each session, and other session-specific variables. Further, we can conduct this test for all 3 clusters of neurons as well as for the conglomerate effect all neurons. By doing this, we examine whether or not different types of neurons respond differently to the stimuli.
+
+The full model can be fitted as follows:
+$$
+Y_{ijkl} = \mu_{...} + \alpha_i + \beta_j + (\alpha\beta)_{ij} + \eta_l + \epsilon_{ijkl} \\
+i = 1, 2, 3, 4 \\
+j = 1, 2, 3, 4 \\
+k = 1, 2, 3, 4, 5 \\
+l = 1, 2, ... , n_{ijk} \\
+\epsilon_{ijk} \overset{i.i.d}{\sim} N(0,\sigma^2) \\
+\eta_l \overset{i.i.d}{\sim} N(0,\sigma_{\eta}^2)
+$$
+<br/>
+
+Similarly, the reduced model is as follows, with similar assumptions:
+$$
+Y_{ijkl} = \mu_{...} + \alpha_i + \beta_j  + \eta_l + \epsilon_{ijkl} \\
+$$
+
+<br/>
+
+Here, Y is the average firing rate, $\mu_{...}$ is the population mean, $\alpha$ is the left contrast (fixed), $\beta$ is the right contrast (fixed), $(\alpha\beta)$ is the interaction between right and left contrast (fixed), $\eta$ is the random session effects term, and $\epsilon$ is the random (observation level) error term.  Here, the index i represents one of four levels of right contrast, j represents one of four levels of left contrast, k represents one of 5 sessions, and l represents one observation. Recall that we include the random error term for session $\eta$ to account for any differences between the session, including the fact that the sessions may have different animals.
+We also make the assumptions that both the session random effect and the random error term are normally distributed with mean 0 and constant variance $\sigma_\eta^2$ or $\sigma^2$, respectively. We also assume that the session effect and random error are mutually independent. 
+
+<br/>
+
+
+The fixed factors take on the sum to zero constraints:
+$$
+\sum_{i=1}^{4}\alpha_i = \sum_{j=1}^{4}\beta_j = 0 \\
+\sum_{i}^{4}(\alpha\beta)_{ij} = \sum_{j}^{4}(\alpha\beta)_{ij} = 0 \ for \ all \ (i, j)
+$$
+
+
+
+<br/>
+
+The full/reduced tests can be conducted using the $\chi^2$ likelihood ratio test. We test the hypothesis for every cluster at the 0.05 significance level:
+
+$$
+H_0: (\alpha\beta)_{ij}=0 \ for \ all \ (i,j) \\
+H_a: not \ every \ statement \ above \ is \ true
+$$
+
+<br/>
+
+Here we obtain a p-values of 0.118 for cluster 1, 0.00078 for cluster 2, and 0.0113 for cluster 3. Additionally, on the conglomerate mean effect of all neurons we obtain a p-value of 0.023. We reject the null hypothesis for every model except cluster 1. This result highlights that different neurons do respond differently to the stimuli - the interaction between right and left contrasts are significant for clusters 2 and 3, but not for cluster 1.
+
+```{r, warning=F, message=F, error=F}
+## FULL MODELS
+# All neurons
+full_all = lmer(avg_rate~right_contrast*left_contrast + (1|session), data=avg_rates)
+
+# Cluster 1
+full_cluster1 = lmer(avg_rate~right_contrast*left_contrast + (1|session), data=cluster1_df)
+
+# Cluster 2
+full_cluster2 = lmer(avg_rate~right_contrast*left_contrast + (1|session), data=cluster2_df)
+
+# Cluster 3
+full_cluster3 = lmer(avg_rate~right_contrast*left_contrast + (1|session), data=cluster3_df)
+
+
+## REDUCED MODELS
+# All neurons
+red_all = lmer(avg_rate~right_contrast + left_contrast + (1|session), data=avg_rates)
+
+# Cluster 1
+red_cluster1 = lmer(avg_rate~right_contrast + left_contrast + (1|session), data=cluster1_df)
+
+# Cluster 2
+red_cluster2 = lmer(avg_rate~right_contrast + left_contrast + (1|session), data=cluster2_df)
+
+# Cluster 3
+red_cluster3 = lmer(avg_rate~right_contrast + left_contrast + (1|session), data=cluster3_df)
+
+## Likelihood ratio test for significant interactions
+a1 = anova(full_all, red_all)
+a2 = anova(full_cluster1, red_cluster1)
+a3 = anova(full_cluster2, red_cluster2)
+a4 = anova(full_cluster3, red_cluster3)
+
+p_vals = c(a1$`Pr(>Chisq)`[2], a2$`Pr(>Chisq)`[2], a3$`Pr(>Chisq)`[2], a4$`Pr(>Chisq)`[2])
+```
+
+## ANOVA F-tests
+We can also test for the significance of the other terms in the model. Since the design is unbalanced, we use Type 3 ANOVA tests using Satterthwaite’s method. The interaction terms are kept in the model (full models) for interpretability, since all of them were significant with the exception of cluster 1. The resulting p-values are shown in the table below.
+
+```{r, warning=F, message=F, error=F}
+# Get anova tables
+table_all = anova(full_all)
+table1 = anova(full_cluster1)
+table2 = anova(full_cluster2)
+table3 = anova(full_cluster3)
+
+# Get p-values
+p_all = round(table_all$`Pr(>F)`, 3)
+p_1 = round(table1$`Pr(>F)`, 3)
+p_2 = round(table2$`Pr(>F)`, 3)
+p_3 = round(table3$`Pr(>F)`, 3)
+
+# Combine into dataframe
+p_vals_df = data.frame(p_all, p_1, p_2, p_3)
+colnames(p_vals_df) = c('All neurons', 'Cluster 1', 'Cluster 2', 'Cluster 3')
+rownames(p_vals_df) = c('Right contrast', 'Left contrast', 'Interaction right/left')
+
+kable(p_vals_df, caption='Type-3 ANOVA Test p-values')
+```
+
+At the 0.05 significance level, we find significant differences between the neuron clusters. For cluster 1, only the main effects of left contrast was significant. For cluster 2, both the main effects and the interaction on contrasts were significant. On Cluster 3, only the main effect of right contrast was not significant. This result again underscores the finding that the behavior of neurons in response to external stimuli may depend on the type of neuron studied. Recall that clusters in this analysis are a surrogate for different neuron types.
+
+In this analysis we do not examine the fitted coefficients themselves since there are too many to present for all four models and do not provide much additional insight in answering the question if different clusters of neurons behave differently.
+
+# Sensitivity Analysis
+## Model Diagnostics
+
+Below, we show residual QQ-plots for all 4 models. Clusters 2 and 3 do not show severe deviations from normality, although they have slightly heavy right tails. The deviation is much more severe in Cluster 3, which shows much heavier right tails compared to normal. After examining the residual vs. fitted value plots (not shown), we find no obvious patterns or signs of non-equal variance.
+
+```{r, warning=F, message=F, error=F}
+# Residual QQ-plot
+resi_all = data.frame(y=summary(full_all)$residuals)
+resi_1 = data.frame(y=summary(full_cluster1)$residuals)
+resi_2 = data.frame(y=summary(full_cluster2)$residuals)
+resi_3 = data.frame(y=summary(full_cluster3)$residuals)
+
+p1 = ggplot(resi_all, aes(sample=y)) + stat_qq() + stat_qq_line() + xlab('theoretical quantiles') + ylab('sample quantiles') + ggtitle('Residual QQ, All Neurons')
+p2 = ggplot(resi_1, aes(sample=y)) + stat_qq() + stat_qq_line() + xlab('theoretical quantiles') + ylab('sample quantiles') + ggtitle('Residual QQ, Cluster 1')
+p3 = ggplot(resi_2, aes(sample=y)) + stat_qq() + stat_qq_line() + xlab('theoretical quantiles') + ylab('sample quantiles') + ggtitle('Residual QQ, Cluster 2')
+p4 = ggplot(resi_3, aes(sample=y)) + stat_qq() + stat_qq_line() + xlab('theoretical quantiles') + ylab('sample quantiles') + ggtitle('Residual QQ, Cluster 3')
+
+p1 + p2 + p3 + p4
+```
+
+
+<br/>
+
+
+To check that the results are robust to the parametric assumptions, i.e., the assumptions of normality and equal variance, we refit non-parametric models using the rank test and compare results. It is important to note, however, that we are no longer able to include session as a random effects term, which may make these results overly optimistic in some cases given the design of the experiment. The p-values from the rank test are provided below.
+
+
+```{r, warning=F, message=F, error=F}
+# add ranks to data
+avg_rates$ranks = rank(avg_rates$avg_rate)
+cluster1_df$ranks = rank(cluster1_df$avg_rate)
+cluster2_df$ranks = rank(cluster2_df$avg_rate)
+cluster3_df$ranks = rank(cluster3_df$avg_rate)
+
+# conduct rank test
+test.rank_all = anova(lm(ranks ~ left_contrast * right_contrast, data=avg_rates))
+test.rank_1 = anova(lm(ranks ~ left_contrast * right_contrast, data= cluster1_df))
+test.rank_2 = anova(lm(ranks ~ left_contrast * right_contrast, data= cluster2_df))
+test.rank_3 = anova(lm(ranks ~ left_contrast * right_contrast, data= cluster3_df))
+
+# get p-values
+p_all = round(test.rank_all$`Pr(>F)`, 3)[1:3]
+p_1 = round(test.rank_1$`Pr(>F)`, 3)[1:3]
+p_2 = round(test.rank_2$`Pr(>F)`, 3)[1:3]
+p_3 = round(test.rank_3$`Pr(>F)`, 3)[1:3]
+
+# Combine into dataframe
+p_vals_df = data.frame(p_all, p_1, p_2, p_3)
+p_vals_df = p_vals_df[c(2, 1, 3), ] # reorder to match parametric table
+
+colnames(p_vals_df) = c('All neurons', 'Cluster 1', 'Cluster 2', 'Cluster 3')
+rownames(p_vals_df) = c('Right contrast', 'Left contrast', 'Interaction right/left')
+
+kable(p_vals_df, caption='ANOVA Table: Rank Test p-values')
+```
+
+
+Overall we find that some results have shifted. For example, in cluster 1 right contrast was not significant (at level 0.05) before and is now significant. In cluster 2, left contrast was significant before but is no longer significant. Interestingly, results in cluster 3 remain the same even though residuals from cluster 3 had the greater departure from normality. This means that the results are sensitive to 1) the parametric assumptions and 2) the inclusion of the session random effects term. However, the key takeaway from the parametric analysis, i.e., that the behavior of neurons in response to visual stimuli changes depending on the type of neuron, is still the same. Even in the nonparametric tests, we see distinct responses between the different clusters.
+
+## Note About k-Means
+
+A key decision in this project is the choice of k-clusters in the analysis. Fortunately, Jasper Tsai, a classmate and colleague of mine conducted a similar analysis on the same dataset, but with the choice of 4 clusters instead of 3, and exploring a different method of dropping low-firing neurons. Jasper found very similar results as we do here - that the behavior of the neurons changes with each cluster. Another important decision is the choice of the k-means algorithm itslef. While we had only enough time to conduct analysis on k-means, other clustering algorithms, including hierarchical and spectral clustering, may yield different results. The use of different clustering algorithms may indeed be an avenue for future work.
+
+# Predictive Modeling
+In this section, we try predict the feedback of the mouse based on a trial’s right and left contrasts as well as the mouse’s neural activity (mean firing rate in each of the 3 neuron clusters) during that trial. This analysis, and the performance of the ensuing models, will provide insight into how strongly the success of the outcome is related to mean firing rate and the associated stimuli. Here, we treat right and left contrasts as continuous covariates, which enables the interpolation for future experiments that may not have used exactly the same contrast levels. Additionally, it enables us to describe the same data in fewer coefficients - which might reduce the risk of overfitting. Here, we remove the first 100 trials as the test set and train the model on the remaining trials where performance is later evaluated on the test set.
+
+## Logistic Regression
+Initially, we attempt prediction with logistic regression, which assumes a linear relationship between the covariates and the log-odds of the outcome. The logistic regression model can be written as follows:
+
+<br/>
+
+$$
+logit(Y_i) = \beta_0 + \beta_1X_{1i} + \beta_2X_{2i} + \beta_3X_{1i}X_{2i} + \sum_{j=1}^{3}\beta_jX_{ji}
+$$
+
+<br/>
+
+Here, $\beta_0$ is the intercept and $\beta_1$, $\beta_2$, $\beta_3$ are the coefficients corresponding to left and right contrast and their interaction, respectively. $\beta_j$ corresponds to the coefficients on the mean firing rates from one of the three neuron clusters, where j=1, 2, 3. The vector $X_i$ are the respective values for each covariate on the ith trial.
+
+```{r, warning=F, message=F, error=F}
+## Process data
+set.seed(220)
+
+# start with copy of cluster1_df
+data = cluster1_df
+data = subset(data, select=-c(cluster))
+colnames(data)[colnames(data) == "avg_rate"] = "cluster_1"
+
+# add data from cluster2
+data$cluster_2 = cluster2_df$avg_rate
+
+# add data from cluster3
+data$cluster_3 = cluster3_df$avg_rate
+
+# convert feedback to binary factor (convert -1 to 0)
+data$feedback[data$feedback==-1] = 0
+data$feedback = as.factor(data$feedback)
+
+# convert contrasts to numeric
+data$left_contrast = as.numeric(data$left_contrast)
+data$right_contrast = as.numeric(data$right_contrast)
+
+## Train-test split
+test_index = 1:100
+
+data_train = data[-test_index, ]
+data_test = data[test_index, ]
+
+## Fit logistic regression model
+logistic_fit = glm(feedback ~ right_contrast*left_contrast + cluster_1 + cluster_2 + cluster_3,
+                   family="binomial",
+                   data=data_train)
+
+## Predict on the test set and evaluate performance
+
+# Predict feedback probabilities
+logistic_pred = predict(logistic_fit, data_test, type="response")
+
+## Draw ROC Curve
+logi_pred = prediction(logistic_pred, data_test$feedback)
+logi_perf = performance(logi_pred, measure = "tpr", x.measure = "fpr")
+
+# Draw the ROC curve
+plot(logi_perf, main = "Logistic Regression ROC Curve")
+abline(0, 1, col='red')
+```
+
+
+<br/>
+
+
+```{r}
+# AUC score
+auc_logi = performance(logi_pred, "auc")@y.values
+```
+
+If we choose a probability cutoff of about 0.70, we obtain a true positive rate (sensitivity) of 0.770 and a false positive rate (1-specificity) of 0.538 in the ROC space. This is a reasonable balance between sensitivity and specificity. Additionally, the model obtains an AUC score (area under the ROC curve; ranges between 0 and 1) of 0.688, which is reasonably good performance. A dataframe of sensitivity and specificity values with their corresponding thresholds is available in the Appendix. As an interesting note, cluster 2 is a significant predictor in this model (and has the lowest p-value of all predictors) while cluster 1 and cluster 3 were not. The interaction term was also not found be significant, which is unexpected since Steinmetz et al. (2019) found that the accuracy of the mouse’s actions are largely dependent on the interaction between contrasts. For example, mice performed their best with high contrast on one side and low contrast on the other, and performed less well when the contrasts and both sides were more similar. Additionally, coefficients on the cluster firing rates are positive - meaning that a higher firing rate is linearly associated with a higher log-odds of a positive feedback which is reasonable.
+
+## Random Forest Prediction
+The functional form of the logistic regression analysis above assumes a linear relationship between the covariates and the log-odds and may miss important non-linear relationships. Here, we explore the possibility of non-linear relationships by using the same model features and using a random forest. After plotting the number of trees with the AUC score on the test set, we find that performance levels off at about 1000 tress (see Appendix). Thus, we choose 1000 trees for the final model.
+
+
+
+```{r, warning=F, message=F, error=F}
+set.seed(220)
+# Fit random forest on training data
+RF_fit = randomForest(formula=feedback ~ right_contrast*left_contrast + cluster_1 + cluster_2 + cluster_3, data=data_train, ntree=1000)
+
+# Get prediction on the test data
+RF_prediction = predict(RF_fit, data_test, type="prob")
+RF_prediction = RF_prediction[, 2]
+
+# Get ROC curve
+RF_pred = prediction(RF_prediction, data_test$feedback)
+RF_perf = performance(RF_pred, measure = "tpr", x.measure = "fpr")
+
+# Draw the ROC curve
+plot(RF_perf, main = "Random Forest ROC Curve")
+abline(0, 1, col='red')
+```
+
+
+<br/>
+
+
+```{r}
+# AUC score
+auc_rf = performance(RF_pred, "auc")@y.values
+```
+
+We obtain an AUC score of 0.703 for the random forest, which is slightly better than the AUC score from the logistic regression (0.688). However, the sacrifice of interpretability and the additional computational resources needed between logistic regression and random forest is not worth the approximately 0.01 increase in AUC performance.
+
+
+
+Overall, we find that feedback can be predicted decently well with coupled neural activity and stimuli information.
+
+# References
+1. Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+<br/>
+
+2. Vandergriendt, C. (2018, July 20). An easy guide to neuron diagrams and types. Healthline. Retrieved March 18, 2023, from https://www.healthline.com/health/neurons#types
+
+# Appendix
+1. Table of the number of neurons per session
+
+```{r}
+# Table of the number of neurons per session
+num_neurons = function(session_number, og_data=session, drop_data=session_drop1){
+  ID = session_number
+  
+  original = dim(og_data[[ID]]$spks[[1]])[1]
+  after_dropping = length(drop_data[[ID]]$clusters)
+  
+  return(c(original, after_dropping))
+}
+
+data = matrix(data = c(num_neurons(1), num_neurons(2), num_neurons(3), num_neurons(4), num_neurons(5)), ncol=2, nrow=5, byrow = TRUE)
+rownames(data) = c('Session 1', 'Session 2', 'Session 3', 'Session 4', 'Session 5')
+colnames(data) = c('Original neurons', 'After dropping neurons')
+
+kable(as.table(data), caption='Before and after dropping neurons with avg firing rate <1')
+```
+
+2. Distribution of left contrast / right contrast / feedback between sessions
+```{r}
+## distribution of left contrast / right contrast / feedback between sessions
+
+Palette <- c("orange", "blue", "lightblue", "lightgreen", "darkgreen")
+
+
+p1 = ggplot(data=avg_rates, aes(x=as.factor(left_contrast), fill=session)) +
+  geom_bar(stat="count", position=position_dodge()) + xlab('Left contrast') + ylab('Frequencies') + ggtitle('Left contrast') + scale_fill_manual(values=Palette)
+
+p2 = ggplot(data=avg_rates, aes(x=as.factor(right_contrast), fill=session)) +
+  geom_bar(stat="count", position=position_dodge()) + xlab('Right contrast') + ylab('Frequencies') + ggtitle('Right contrast') + scale_fill_manual(values=Palette)
+
+p3 = ggplot(data=avg_rates, aes(x=as.factor(feedback), fill=session)) +
+  geom_bar(stat="count", position=position_dodge()) + xlab('Feedback') + ylab('Frequencies') + ggtitle('Feedback') + scale_fill_manual(values=Palette)
+
+p1 + p2 + p3 + plot_layout(ncol=2)
+```
+
+3. Proportion of assigned clusters
+```{r}
+# fit kmeans with 3 clusters
+kmeans = kmeans(all_scale_neurons, centers = 3)
+
+# add clusters to dataframe
+all_scale_neurons = as.data.frame(all_scale_neurons)
+all_scale_neurons$cluster = kmeans$cluster
+
+# add session information (order is preserved)
+all_scale_neurons$session = c(rep(1, dim(session_drop1[[1]]$spks[[1]])[1]),
+                              rep(2, dim(session_drop1[[2]]$spks[[1]])[1]),
+                              rep(3, dim(session_drop1[[3]]$spks[[1]])[1]),
+                              rep(4, dim(session_drop1[[4]]$spks[[1]])[1]),
+                              rep(5, dim(session_drop1[[5]]$spks[[1]])[1]))
+
+# plot frequency of each cluster
+cluster_freq = table(all_scale_neurons$cluster)
+pie(cluster_freq, main="frequency of assigned clusters")
+```
+
+4. Dataframe of probability threshold values and their corresponding true positive rate (sensitivity) and false positive rate (1-specificity) for the logistic regression model.
+
+```{r}
+## Dataframe of Sensitivity/Specificity vs probability threshold (Logistic)
+cutoffs = data.frame(cutoff=logi_perf@alpha.values[[1]], fpr=logi_perf@x.values[[1]], 
+                      tpr=logi_perf@y.values[[1]])
+cutoffs
+```
+
+5. Hyperparameter tuning: choosing the number of trees in the random forest.
+```{r}
+# tune hyperparameter (number of trees)
+set.seed(220)
+
+ntress = seq(1, 3000, by=100)
+auc_scores = c()
+
+for (i in 1:length(ntress)) {
+  # Fit random forest on training data 
+  RF_fit = randomForest(formula=feedback ~ right_contrast*left_contrast + cluster_1 + cluster_2 + cluster_3, data=data_train, ntree=ntress[i])
+  
+  # Get prediction on the test data
+  RF_prediction = predict(RF_fit, data_test, type="prob")
+  RF_prediction = RF_prediction[, 2]
+
+
+  # Get ROC curve
+  RF_pred = prediction(RF_prediction, data_test$feedback)
+  RF_perf = performance(RF_pred, measure = "tpr", x.measure = "fpr")
+
+  # AUC score
+  auc_scores[i] = performance(RF_pred, "auc")@y.values
+  
+}
+
+plot(ntress, auc_scores, type='b')
+```
+
+
+6. Dataframe of probability threshold values and their corresponding true positive rate (sensitivity) and false positive rate (1-specificity) for the random forest model.
+
+```{r}
+## Dataframe of Sensitivity/Specificity vs probability threshold (Logistic)
+cutoffs = data.frame(cutoff=RF_perf@alpha.values[[1]], fpr=RF_perf@x.values[[1]], 
+                      tpr=RF_perf@y.values[[1]])
+cutoffs
+```
+
+# Acknowledgements
+In this project, I consulted heavily with Professor Chen in office hours as well as used code from course notes in the analysis. I also discussed project methodologies with classmates Jasper Tsai (referenced within) and Mark Fanyboym.
+
+
+
