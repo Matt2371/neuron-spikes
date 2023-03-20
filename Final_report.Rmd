@@ -658,7 +658,7 @@ We can test for the statistical significance of the interaction between left and
 
 The full model can be fitted as follows:
 $$
-Y_{ijkl} = \mu_{...} + \alpha_i + \beta_j + (\alpha\beta)_{ij} + \eta_l + \epsilon_{ijkl} \\
+Y_{ijkl} = \mu_{...} + \alpha_i + \beta_j + (\alpha\beta)_{ij} + \eta_k + \epsilon_{ijkl} \\
 i = 1, 2, 3, 4 \\
 j = 1, 2, 3, 4 \\
 k = 1, 2, 3, 4, 5 \\
@@ -670,7 +670,7 @@ $$
 
 Similarly, the reduced model is as follows, with similar assumptions:
 $$
-Y_{ijkl} = \mu_{...} + \alpha_i + \beta_j  + \eta_l + \epsilon_{ijkl} \\
+Y_{ijkl} = \mu_{...} + \alpha_i + \beta_j  + \eta_k + \epsilon_{ijkl} \\
 $$
 
 <br/>
